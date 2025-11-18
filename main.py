@@ -10,11 +10,19 @@ from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
 
 from config import read_global_config, get_config_sync
-from auth import get_auth_headers
+from auth import get_auth_headers_with_retry, refresh_account_token, NoAccountAvailableError, TokenRefreshError
+from account_manager import (
+    list_enabled_accounts, list_all_accounts, get_account,
+    create_account, update_account, delete_account
+)
 from models import ClaudeRequest
 from converter import convert_claude_to_codewhisperer_request, codewhisperer_request_to_dict
 from stream_handler_new import handle_amazonq_stream
 from message_processor import process_claude_history_for_amazonq, log_history_summary
+from pydantic import BaseModel
+from typing import Dict, Any, Optional
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 # 配置日志
 logging.basicConfig(
@@ -50,6 +58,35 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# 添加 CORS 中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Pydantic 模型
+class AccountCreate(BaseModel):
+    label: Optional[str] = None
+    clientId: str
+    clientSecret: str
+    refreshToken: Optional[str] = None
+    accessToken: Optional[str] = None
+    other: Optional[Dict[str, Any]] = None
+    enabled: Optional[bool] = True
+
+
+class AccountUpdate(BaseModel):
+    label: Optional[str] = None
+    clientId: Optional[str] = None
+    clientSecret: Optional[str] = None
+    refreshToken: Optional[str] = None
+    accessToken: Optional[str] = None
+    other: Optional[Dict[str, Any]] = None
+    enabled: Optional[bool] = None
+
 
 @app.get("/")
 async def root():
@@ -63,17 +100,156 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """健康检查端点"""
+    """健康检查端点 - 实际调用 API 验证账号可用性"""
     try:
+        all_accounts = list_all_accounts()
+        enabled_accounts = [acc for acc in all_accounts if acc.get('enabled')]
+
+        if not enabled_accounts:
+            return {
+                "status": "unhealthy",
+                "reason": "no_enabled_accounts",
+                "enabled_accounts": 0,
+                "total_accounts": len(all_accounts)
+            }
+
+        # 测试第一个启用账号的可用性
+        test_account = enabled_accounts[0]
         config = get_config_sync()
-        return {
-            "status": "healthy",
-            "has_token": config.access_token is not None,
-            "token_expired": config.is_token_expired()
-        }
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                # 使用与 /v1/messages 相同的逻辑获取认证头（自动处理 JWT 过期和刷新）
+                test_account, auth_headers_base = await get_auth_headers_with_retry()
+
+                headers = {
+                    **auth_headers_base,
+                    'Content-Type': 'application/x-amz-json-1.0',
+                    'X-Amz-Target': 'AmazonCodeWhispererStreamingService.GenerateAssistantResponse'
+                }
+
+                test_body = {
+                    "conversationState": {
+                        "currentMessage": {"userInputMessage": {"content": "hi"}},
+                        "chatTriggerType": "MANUAL"
+                    }
+                }
+
+                response = await client.post(
+                    config.api_endpoint,
+                    headers=headers,
+                    json=test_body
+                )
+
+                # 如果 401/403，尝试刷新 token 并重试
+                if response.status_code in (401, 403):
+                    error_text = response.text
+                    if "TEMPORARILY_SUSPENDED" in error_text:
+                        # 检测到封号，保存封禁信息
+                        from datetime import datetime
+                        suspend_info = {
+                            "suspended": True,
+                            "suspended_at": datetime.now().isoformat(),
+                            "suspend_reason": "TEMPORARILY_SUSPENDED"
+                        }
+                        current_other = test_account.get('other') or {}
+                        current_other.update(suspend_info)
+                        update_account(test_account['id'], enabled=False, other=current_other)
+
+                        return {
+                            "status": "unhealthy",
+                            "reason": "account_suspended",
+                            "error": "账号已被封禁",
+                            "enabled_accounts": len(enabled_accounts),
+                            "total_accounts": len(all_accounts)
+                        }
+
+                    # 尝试刷新 token 并重试
+                    try:
+                        test_account = await refresh_account_token(test_account)
+                        access_token = test_account.get('accessToken')
+                        headers['Authorization'] = f'Bearer {access_token}'
+
+                        # 使用新 token 重试
+                        retry_response = await client.post(
+                            config.api_endpoint,
+                            headers=headers,
+                            json=test_body
+                        )
+
+                        if retry_response.status_code == 403 and "TEMPORARILY_SUSPENDED" in retry_response.text:
+                            # 重试后仍然封号
+                            from datetime import datetime
+                            suspend_info = {
+                                "suspended": True,
+                                "suspended_at": datetime.now().isoformat(),
+                                "suspend_reason": "TEMPORARILY_SUSPENDED"
+                            }
+                            current_other = test_account.get('other') or {}
+                            current_other.update(suspend_info)
+                            update_account(test_account['id'], enabled=False, other=current_other)
+
+                            return {
+                                "status": "unhealthy",
+                                "reason": "account_suspended",
+                                "error": "账号已被封禁",
+                                "enabled_accounts": len(enabled_accounts),
+                                "total_accounts": len(all_accounts)
+                            }
+
+                        if retry_response.status_code == 200:
+                            return {
+                                "status": "healthy",
+                                "enabled_accounts": len(enabled_accounts),
+                                "total_accounts": len(all_accounts),
+                                "tested_account": test_account.get('label') or test_account['id']
+                            }
+
+                        return {
+                            "status": "unhealthy",
+                            "reason": f"api_error_{retry_response.status_code}",
+                            "error": retry_response.text[:200],
+                            "enabled_accounts": len(enabled_accounts),
+                            "total_accounts": len(all_accounts)
+                        }
+                    except Exception as refresh_error:
+                        return {
+                            "status": "unhealthy",
+                            "reason": "token_refresh_failed",
+                            "error": str(refresh_error),
+                            "enabled_accounts": len(enabled_accounts),
+                            "total_accounts": len(all_accounts)
+                        }
+
+                if response.status_code == 200:
+                    return {
+                        "status": "healthy",
+                        "enabled_accounts": len(enabled_accounts),
+                        "total_accounts": len(all_accounts),
+                        "tested_account": test_account.get('label') or test_account['id']
+                    }
+
+                return {
+                    "status": "unhealthy",
+                    "reason": f"api_error_{response.status_code}",
+                    "error": response.text[:200],
+                    "enabled_accounts": len(enabled_accounts),
+                    "total_accounts": len(all_accounts)
+                }
+
+            except Exception as api_error:
+                return {
+                    "status": "unhealthy",
+                    "reason": "api_call_failed",
+                    "error": str(api_error),
+                    "enabled_accounts": len(enabled_accounts),
+                    "total_accounts": len(all_accounts)
+                }
+
     except Exception as e:
         return {
             "status": "unhealthy",
+            "reason": "system_error",
             "error": str(e)
         }
 
@@ -168,8 +344,19 @@ async def create_message(request: Request):
         import json
         logger.info(f"转换后的请求体: {json.dumps(final_request, indent=2, ensure_ascii=False)}")
 
-        # 获取认证头
-        base_auth_headers = await get_auth_headers()
+        # 获取账号和认证头（支持多账号随机选择和单账号回退）
+        try:
+            account, base_auth_headers = await get_auth_headers_with_retry()
+            if account:
+                logger.info(f"使用多账号模式 - 账号: {account.get('id')} (label: {account.get('label', 'N/A')})")
+            else:
+                logger.info("使用单账号模式（.env 配置）")
+        except NoAccountAvailableError as e:
+            logger.error(f"无可用账号: {e}")
+            raise HTTPException(status_code=503, detail="没有可用的账号，请在管理页面添加账号或配置 .env 文件")
+        except TokenRefreshError as e:
+            logger.error(f"Token 刷新失败: {e}")
+            raise HTTPException(status_code=502, detail="Token 刷新失败")
 
         # 构建 Amazon Q 特定的请求头（完整版本）
         import uuid
@@ -189,11 +376,10 @@ async def create_message(request: Request):
         # 发送请求到 Amazon Q
         logger.info("正在发送请求到 Amazon Q...")
 
-        # API URL（根路径，不需要额外路径）
-        config = await read_global_config()
-        api_url = config.api_endpoint.rstrip('/')
+        # API URL
+        api_url = "https://q.us-east-1.amazonaws.com/"
 
-        # 创建字节流响应
+        # 创建字节流响应（支持 401/403 重试）
         async def byte_stream():
             async with httpx.AsyncClient(timeout=300.0) as client:
                 try:
@@ -204,7 +390,89 @@ async def create_message(request: Request):
                         headers=auth_headers
                     ) as response:
                         # 检查响应状态
-                        if response.status_code != 200:
+                        if response.status_code in (401, 403):
+                            # 401/403 错误：刷新 token 并重试
+                            logger.warning(f"收到 {response.status_code} 错误，尝试刷新 token 并重试")
+                            error_text = await response.aread()
+                            error_str = error_text.decode() if isinstance(error_text, bytes) else str(error_text)
+                            logger.error(f"原始错误: {error_str}")
+
+                            # 检测账号是否被封
+                            if "TEMPORARILY_SUSPENDED" in error_str and account:
+                                logger.error(f"账号 {account['id']} 已被封禁，自动禁用")
+                                from datetime import datetime
+                                suspend_info = {
+                                    "suspended": True,
+                                    "suspended_at": datetime.now().isoformat(),
+                                    "suspend_reason": "TEMPORARILY_SUSPENDED"
+                                }
+                                current_other = account.get('other') or {}
+                                current_other.update(suspend_info)
+                                update_account(account['id'], enabled=False, other=current_other)
+                                raise HTTPException(status_code=403, detail=f"账号已被封禁: {error_str}")
+
+                            try:
+                                # 刷新 token（支持多账号和单账号模式）
+                                if account:
+                                    # 多账号模式：刷新当前账号
+                                    refreshed_account = await refresh_account_token(account)
+                                    new_access_token = refreshed_account.get("accessToken")
+                                else:
+                                    # 单账号模式：刷新 .env 配置的 token
+                                    from auth import refresh_legacy_token
+                                    await refresh_legacy_token()
+                                    from config import read_global_config
+                                    config = await read_global_config()
+                                    new_access_token = config.access_token
+
+                                if not new_access_token:
+                                    raise HTTPException(status_code=502, detail="Token 刷新后仍无法获取 accessToken")
+
+                                # 更新认证头
+                                auth_headers["Authorization"] = f"Bearer {new_access_token}"
+                                logger.info(f"Token 刷新成功，使用新 token 重试请求")
+
+                                # 使用新 token 重试
+                                async with client.stream(
+                                    "POST",
+                                    api_url,
+                                    json=final_request,
+                                    headers=auth_headers
+                                ) as retry_response:
+                                    if retry_response.status_code != 200:
+                                        retry_error = await retry_response.aread()
+                                        retry_error_str = retry_error.decode() if isinstance(retry_error, bytes) else str(retry_error)
+                                        logger.error(f"重试后仍失败: {retry_response.status_code} {retry_error_str}")
+
+                                        # 重试后仍然失败，检测是否被封
+                                        if retry_response.status_code == 403 and "TEMPORARILY_SUSPENDED" in retry_error_str and account:
+                                            logger.error(f"账号 {account['id']} 已被封禁，自动禁用")
+                                            from datetime import datetime
+                                            suspend_info = {
+                                                "suspended": True,
+                                                "suspended_at": datetime.now().isoformat(),
+                                                "suspend_reason": "TEMPORARILY_SUSPENDED"
+                                            }
+                                            current_other = account.get('other') or {}
+                                            current_other.update(suspend_info)
+                                            update_account(account['id'], enabled=False, other=current_other)
+
+                                        raise HTTPException(
+                                            status_code=retry_response.status_code,
+                                            detail=f"重试后仍失败: {retry_error_str}"
+                                        )
+
+                                    # 重试成功，返回数据流
+                                    async for chunk in retry_response.aiter_bytes():
+                                        if chunk:
+                                            yield chunk
+                                    return
+
+                            except TokenRefreshError as e:
+                                logger.error(f"Token 刷新失败: {e}")
+                                raise HTTPException(status_code=502, detail=f"Token 刷新失败: {str(e)}")
+
+                        elif response.status_code != 200:
                             error_text = await response.aread()
                             logger.error(f"上游 API 错误: {response.status_code} {error_text}")
                             raise HTTPException(
@@ -212,7 +480,7 @@ async def create_message(request: Request):
                                 detail=f"上游 API 错误: {error_text.decode()}"
                             )
 
-                        # 处理 Event Stream（字节流）
+                        # 正常响应，处理 Event Stream（字节流）
                         async for chunk in response.aiter_bytes():
                             if chunk:
                                 yield chunk
@@ -241,6 +509,104 @@ async def create_message(request: Request):
     except Exception as e:
         logger.error(f"处理请求时发生错误: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+
+# 账号管理 API 端点
+@app.get("/v2/accounts")
+async def list_accounts():
+    """列出所有账号"""
+    accounts = list_all_accounts()
+    return JSONResponse(content=accounts)
+
+
+@app.get("/v2/accounts/{account_id}")
+async def get_account_detail(account_id: str):
+    """获取账号详情"""
+    account = get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    return JSONResponse(content=account)
+
+
+@app.post("/v2/accounts")
+async def create_account_endpoint(body: AccountCreate):
+    """创建新账号"""
+    try:
+        account = create_account(
+            label=body.label,
+            client_id=body.clientId,
+            client_secret=body.clientSecret,
+            refresh_token=body.refreshToken,
+            access_token=body.accessToken,
+            other=body.other,
+            enabled=body.enabled if body.enabled is not None else True
+        )
+        return JSONResponse(content=account)
+    except Exception as e:
+        logger.error(f"创建账号失败: {e}")
+        raise HTTPException(status_code=500, detail=f"创建账号失败: {str(e)}")
+
+
+@app.patch("/v2/accounts/{account_id}")
+async def update_account_endpoint(account_id: str, body: AccountUpdate):
+    """更新账号信息"""
+    try:
+        account = update_account(
+            account_id=account_id,
+            label=body.label,
+            client_id=body.clientId,
+            client_secret=body.clientSecret,
+            refresh_token=body.refreshToken,
+            access_token=body.accessToken,
+            other=body.other,
+            enabled=body.enabled
+        )
+        if not account:
+            raise HTTPException(status_code=404, detail="账号不存在")
+        return JSONResponse(content=account)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"更新账号失败: {e}")
+        raise HTTPException(status_code=500, detail=f"更新账号失败: {str(e)}")
+
+
+@app.delete("/v2/accounts/{account_id}")
+async def delete_account_endpoint(account_id: str):
+    """删除账号"""
+    success = delete_account(account_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    return JSONResponse(content={"deleted": account_id})
+
+
+@app.post("/v2/accounts/{account_id}/refresh")
+async def manual_refresh_endpoint(account_id: str):
+    """手动刷新账号 token"""
+    try:
+        account = get_account(account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="账号不存在")
+
+        refreshed_account = await refresh_account_token(account)
+        return JSONResponse(content=refreshed_account)
+    except TokenRefreshError as e:
+        logger.error(f"刷新 token 失败: {e}")
+        raise HTTPException(status_code=502, detail=f"刷新 token 失败: {str(e)}")
+    except Exception as e:
+        logger.error(f"刷新 token 失败: {e}")
+        raise HTTPException(status_code=500, detail=f"刷新 token 失败: {str(e)}")
+
+
+# 管理页面
+@app.get("/admin", response_class=FileResponse)
+async def admin_page():
+    """管理页面"""
+    from pathlib import Path
+    frontend_path = Path(__file__).parent / "frontend" / "index.html"
+    if not frontend_path.exists():
+        raise HTTPException(status_code=404, detail="管理页面不存在")
+    return FileResponse(str(frontend_path))
 
 
 def parse_claude_request(data: dict) -> ClaudeRequest:

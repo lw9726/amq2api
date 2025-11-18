@@ -5,7 +5,10 @@
 ## 功能特性
 
 - ✅ 完整的 Claude API 兼容接口
-- ✅ 自动 Token 刷新机制
+- ✅ 多账号管理和负载均衡
+- ✅ 自动 Token 刷新机制（JWT 过期检测）
+- ✅ 账号封禁自动检测和禁用
+- ✅ Web 管理界面（账号管理、批量导入/导出、健康检查）
 - ✅ SSE 流式响应支持
 - ✅ 请求/响应格式自动转换
 - ✅ 完善的错误处理和日志
@@ -23,15 +26,17 @@ Amazon Q Event Stream → event_stream_parser.py → parser.py → stream_handle
 
 ### 核心模块
 
-- **main.py** - FastAPI 服务器,处理 `/v1/messages` 端点
+- **main.py** - FastAPI 服务器,处理 `/v1/messages` 和管理 API 端点
+- **account_manager.py** - 多账号管理（SQLite 数据库）
+- **auth.py** - Token 自动刷新机制（JWT 过期检测）
 - **converter.py** - 请求格式转换 (Claude → Amazon Q)
 - **event_stream_parser.py** - 解析 AWS Event Stream 二进制格式
 - **parser.py** - 事件类型转换 (Amazon Q → Claude)
 - **stream_handler_new.py** - 流式响应处理和事件生成
 - **message_processor.py** - 历史消息合并,确保 user-assistant 交替
-- **auth.py** - Token 自动刷新机制
 - **config.py** - 配置管理和 Token 缓存
 - **models.py** - 数据结构定义
+- **frontend/index.html** - Web 管理界面
 
 ## 快速开始
 
@@ -129,6 +134,58 @@ curl -X POST http://localhost:8080/v1/messages \
 | `AMAZONQ_API_ENDPOINT` | ❌ | https://q.us-east-1.amazonaws.com/ | API 端点 |
 | `AMAZONQ_TOKEN_ENDPOINT` | ❌ | https://oidc.us-east-1.amazonaws.com/token | Token 端点 |
 
+## 多账号管理
+
+### Web 管理界面
+
+访问 `http://localhost:8080/admin` 打开 Web 管理界面，支持：
+
+- ✅ 账号列表查看（显示启用状态、Token 状态、封禁状态）
+- ✅ 创建/编辑/删除账号
+- ✅ 批量导入/导出账号
+- ✅ 手动刷新 Token
+- ✅ 测试所有启用账号
+- ✅ 健康检查（实际调用 API 验证可用性）
+
+### 账号管理 API
+
+#### GET /v2/accounts
+列出所有账号
+
+#### POST /v2/accounts
+创建新账号
+
+**请求体：**
+```json
+{
+  "label": "账号标签",
+  "clientId": "client_id",
+  "clientSecret": "client_secret",
+  "refreshToken": "refresh_token",
+  "accessToken": "access_token",
+  "enabled": true
+}
+```
+
+#### PATCH /v2/accounts/{account_id}
+更新账号信息
+
+#### DELETE /v2/accounts/{account_id}
+删除账号
+
+#### POST /v2/accounts/{account_id}/refresh
+手动刷新账号 Token
+
+### 账号封禁检测
+
+系统会自动检测账号封禁状态（`TEMPORARILY_SUSPENDED` 错误）：
+
+- ✅ 实时检测：API 请求返回 403 错误时自动检测
+- ✅ 主动检测：健康检查时验证账号可用性
+- ✅ 自动禁用：检测到封号后自动禁用账号
+- ✅ 封禁信息：记录封禁时间和原因到数据库
+- ✅ 前端显示：管理界面显示封禁警告
+
 ## API 接口
 
 ### POST /v1/messages
@@ -159,17 +216,22 @@ curl -X POST http://localhost:8080/v1/messages \
 
 ### GET /health
 
-健康检查端点
+健康检查端点（实际调用 API 验证账号可用性）
 
 **响应：**
 
 ```json
 {
   "status": "healthy",
-  "has_token": true,
-  "token_expired": false
+  "enabled_accounts": 3,
+  "total_accounts": 5,
+  "tested_account": "账号标签"
 }
 ```
+
+### GET /admin
+
+Web 管理界面
 
 ## 工作流程
 
